@@ -348,6 +348,115 @@ class TestExecutePath:
             glb.endGlobal()
 
 
+class TestExecuteParams:
+    """Bound $parameters on the execute path: values skip the query text."""
+
+    def test_failed_execute_frees_prepared_statement(self, rr_env, age_graph):
+        # PREPARE survives ROLLBACK: a failed EXECUTE must not leave its
+        # _rr_age_* statement on the backend connection.
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            for _ in range(3):
+                with pytest.raises(Exception, match='division by zero'):
+                    inst.execute({'query': 'RETURN 10 / $z AS q', 'params': {'z': 0}})
+            with glb.client.cursor() as cur:
+                cur.execute(r"SELECT count(*) FROM pg_prepared_statements WHERE name LIKE '\_rr\_age\_%'")
+                assert cur.fetchone()[0] == 0
+            glb.client.rollback()
+            # The connection stays usable after the failures.
+            assert inst.execute({'query': 'RETURN 10 / $z AS q', 'params': {'z': 2}})['rows'] == [{'q': 5}]
+        finally:
+            glb.endGlobal()
+
+    def test_row_cap_rolls_back_the_write(self, rr_env, age_graph):
+        # The cap is checked before commit: an over-limit write saves nothing,
+        # so a retry cannot duplicate it.
+        glb = _begin(rr_env, {'allow_execute': True, 'max_execute_rows': 3})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            with pytest.raises(ValueError, match='max_execute_rows=3'):
+                inst.execute(
+                    {
+                        'query': 'UNWIND $rows AS r CREATE (i:Item {id: r.id}) RETURN i.id AS id',
+                        'params': {'rows': [{'id': i} for i in range(5)]},
+                    }
+                )
+            assert glb._run_query('MATCH (i:Item) RETURN count(i) AS n') == [{'n': 0}]
+        finally:
+            glb.endGlobal()
+
+    def test_canary_age_unwind_merge_duplicates_repeated_keys(self, rr_env, age_graph):
+        # AGE 1.5.0 gap documented in the READMEs: MERGE does not see nodes
+        # created earlier in the same UNWIND. When this fails, the pin fixed it.
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            inst.execute(
+                {
+                    'query': 'UNWIND $rows AS r MERGE (:U {id: r.id})',
+                    'params': {'rows': [{'id': 1}, {'id': 1}, {'id': 2}]},
+                }
+            )
+            assert glb._run_query('MATCH (u:U) RETURN count(u) AS n') == [{'n': 3}]
+        finally:
+            glb.endGlobal()
+
+    def test_bulk_write_with_unwind_params(self, rr_env, age_graph):
+        # ~1 MB of values: over 50x the query-length cap if pasted inline.
+        rows = [{'id': i, 'name': f'item {i}'} for i in range(20_000)]
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            inst.execute(
+                {'query': 'UNWIND $rows AS r CREATE (:Item {id: r.id, name: r.name})', 'params': {'rows': rows}}
+            )
+            count = glb._run_query('MATCH (i:Item) RETURN count(i) AS n')
+            assert count == [{'n': 20_000}]
+        finally:
+            glb.endGlobal()
+
+    def test_value_round_trips_without_escaping(self, rr_env, age_graph):
+        text = 'quote " apostrophe \' backslash \\ newline \n dollar $rr_cypher$ end'
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            written = inst.execute({'query': 'CREATE (n:Note {text: $t}) RETURN n.text AS text', 'params': {'t': text}})
+            assert written['rows'] == [{'text': text}]
+            back = glb._run_query('MATCH (n:Note) RETURN n.text AS text')
+            assert back == [{'text': text}]
+        finally:
+            glb.endGlobal()
+
+    def test_sql_key_and_params_from_database_query(self, rr_env, age_graph):
+        # client.database.query sends {sql, params}.
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            out = inst.execute(
+                {'sql': 'MATCH (p:Person) WHERE p.name = $who RETURN p.age AS age', 'params': {'who': 'carol'}}
+            )
+            assert out['rows'] == [{'age': 41}]
+        finally:
+            glb.endGlobal()
+
+    def test_params_size_cap_enforced(self, rr_env, age_graph):
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            with pytest.raises(Exception, match='max_params_bytes'):
+                inst.execute({'query': 'CREATE (n:Note {text: $t})', 'params': {'t': 'x' * (9 * 1024 * 1024)}})
+        finally:
+            glb.endGlobal()
+
+
 def _raw_cypher(conn, body: str, columns: str = 'v agtype') -> list:
     """Run Cypher on the test graph directly, bypassing the translation layer."""
     with conn.cursor() as cur:
