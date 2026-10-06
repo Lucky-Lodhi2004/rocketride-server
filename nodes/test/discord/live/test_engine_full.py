@@ -1,0 +1,1141 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+# =============================================================================
+
+"""L4 full engine suite: every base discord node feature through a real engine.
+
+L3 (``test_engine_e2e.py``) proves the node runs under the engine. This layer
+walks every base feature, success and failure, through real pipelines on the
+engine, driven by the driver bot in the test channel only:
+
+- ``echo`` is discord -> a ``response_text`` node keyed ``answers``, so the
+  answer is the question's own text (plus whatever the node adds, such as
+  merged attachments).
+- ``fake`` is discord -> prompt -> ``llm_openai_api`` pointed at
+  :mod:`fake_llm`, a scripted local endpoint for slow and delayed answers. No
+  real model is involved.
+
+Each test posts messages tagged ``[e2e Fxx]``, one at a time, and records a
+result row (feature, case, expected, actual, pass/fail, evidence) to a JSONL
+file under ``DISCORD_E2E_RESULTS_DIR`` (default: the system temp directory).
+
+Gates (all must hold, else the module skips): ``DISCORD_LIVE=1``,
+``DISCORD_E2E_FULL=1`` (the run takes a while and restarts tasks many times),
+the L3 gates, and ``botUserId`` in the engine id block. Optional:
+``DISCORD_E2E_ENGINE_LOG``, the engine's log file, grepped for evidence.
+"""
+
+import json
+import os
+import re
+import subprocess
+import tempfile
+import time
+import wave
+from typing import Any, Callable, Dict, List, Optional
+
+import discord
+import pytest
+
+from .fake_llm import FakeLLM
+from .live_support import EngineSession, engine_reachable, live_ids, live_only
+from .test_engine_e2e import SKIP_REASON as L3_SKIP_REASON
+
+TASK_STATE_RUNNING = 3
+PROJECT_ID = '5d1f0e2a-7c3b-4e9a-8f21-6b0c9d4e3a17'
+FAKE_ROLE_ID = '900000000000000301'
+FAKE_CHANNEL_ID = '900000000000000302'
+QUIET_SECONDS = 15
+RUN_STAMP = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+RESULTS_DIR = os.environ.get('DISCORD_E2E_RESULTS_DIR', '') or os.path.join(tempfile.gettempdir(), 'discord-e2e-full')
+RESULTS_PATH = os.path.join(RESULTS_DIR, f'{RUN_STAMP}.jsonl')
+
+ENGINE_LOG = os.environ.get('DISCORD_E2E_ENGINE_LOG', '')
+
+
+def _full_gate() -> str:
+    if L3_SKIP_REASON:
+        return L3_SKIP_REASON
+    if os.environ.get('DISCORD_E2E_FULL') != '1':
+        return 'DISCORD_E2E_FULL=1 not set (the full suite runs ~30 minutes)'
+    from .live_support import load_engine_config
+
+    if not load_engine_config().get('botUserId'):
+        return 'botUserId (the bot under test) missing from the engine id block'
+    return ''
+
+
+FULL_SKIP = _full_gate()
+pytestmark = [live_only, pytest.mark.skipif(bool(FULL_SKIP), reason=FULL_SKIP or 'full suite enabled')]
+
+
+# -----------------------------------------------------------------------------
+# Result rows
+# -----------------------------------------------------------------------------
+
+
+def _record(fid: str, feature: str, case: str, expected: str, actual: str, ok: bool, evidence: str):
+    row = {
+        'id': fid,
+        'feature': feature,
+        'case': case,
+        'expected': expected,
+        'actual': actual,
+        'result': 'PASS' if ok else 'FAIL',
+        'evidence': evidence,
+        'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+    os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
+    with open(RESULTS_PATH, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + '\n')
+    print(f'\n{fid} {row["result"]} | {feature} | {case} | {actual} | {evidence}')
+
+
+def _check(fid, feature, case, expected, ok, actual, evidence=''):
+    """Record a row, then fail the test when the row failed."""
+    _record(fid, feature, case, expected, actual, bool(ok), evidence)
+    assert ok, f'{fid} {case}: expected {expected}; got {actual}'
+
+
+# -----------------------------------------------------------------------------
+# Pipelines
+# -----------------------------------------------------------------------------
+
+
+def _params(config: Dict[str, str], **overrides) -> Dict[str, Any]:
+    """Discord parameters every test starts from: support channel only, the
+    driver bot allowed, events on, typing off (F09 turns it on).
+    """
+    params: Dict[str, Any] = {
+        'botToken': '${ROCKETRIDE_DISCORD_DISCORD_BOT_TOKEN}',
+        'guildIds': ['${ROCKETRIDE_DISCORD_GUILD_ID}'],
+        'channelIds': ['${ROCKETRIDE_DISCORD_SUPPORT_CHANNEL_ID}'],
+        'allowedBotIds': [config['driverBotId']],
+        'replyMode': 'reply',
+        'threadAutoArchiveMinutes': 60,
+        'showTyping': False,
+        'emitNoReply': True,
+        'emitOutbound': True,
+    }
+    params.update(overrides)
+    return params
+
+
+def _discord_component(params: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'id': 'discord_1',
+        'provider': 'discord',
+        'config': {'hideForm': True, 'mode': 'Source', 'type': 'discord', 'parameters': params},
+    }
+
+
+def _echo(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Discord -> response_text keyed ``answers``: the answer is the text the node sent."""
+    return {
+        'project_id': PROJECT_ID,
+        'version': 1,
+        'components': [
+            _discord_component(params),
+            {
+                'id': 'echo_1',
+                'provider': 'response_text',
+                'config': {'laneName': 'answers'},
+                'input': [{'lane': 'text', 'from': 'discord_1'}],
+            },
+        ],
+    }
+
+
+def _fake(params: Dict[str, Any], fake: FakeLLM) -> Dict[str, Any]:
+    """Discord -> prompt -> llm_openai_api (the scripted fake) -> answers."""
+    return {
+        'project_id': PROJECT_ID,
+        'version': 1,
+        'components': [
+            _discord_component(params),
+            {
+                'id': 'prompt_1',
+                'provider': 'prompt',
+                'config': {'instructions': ['Answer the user.']},
+                'input': [{'lane': 'text', 'from': 'discord_1'}],
+            },
+            {
+                'id': 'llm_1',
+                'provider': 'llm_openai_api',
+                'config': {
+                    'profile': 'custom',
+                    'custom': {
+                        'model': 'fake-e2e',
+                        'base_url': fake.base_url,
+                        'modelTotalTokens': 32768,
+                        'apikey': 'sk-fake-e2e',
+                    },
+                },
+                'input': [{'lane': 'questions', 'from': 'prompt_1'}],
+            },
+            {
+                'id': 'answers_1',
+                'provider': 'response_answers',
+                'config': {'laneName': 'answers'},
+                'input': [{'lane': 'answers', 'from': 'llm_1'}],
+            },
+        ],
+    }
+
+
+def _start(engine: EngineSession, pipeline: Dict[str, Any]) -> str:
+    """(Re)start ``pipeline`` and wait for the node to log in."""
+    engine.start_pipe(pipeline, mode=f'run-{time.time()}', login_timeout=45)
+    assert 'logged in as' in engine.login_status, f'node did not log in: {engine.login_status!r}'
+    return engine.login_status
+
+
+def _start_raw(engine: EngineSession, pipeline: Dict[str, Any], settle: float = 20) -> Dict[str, Any]:
+    """Start a pipe that may fail on purpose; report what the engine says."""
+    engine.terminate()
+    engine.events.clear()
+    outcome: Dict[str, Any] = {'error': '', 'status': '', 'state': None}
+    try:
+        result = engine.run(engine.client.use(pipeline=pipeline, source='discord_1', ttl=0), timeout=120)
+        engine.token = result.get('token') if isinstance(result, dict) else str(result)
+        engine.mode = f'raw-{time.time()}'
+        engine.run(engine.client.set_events(engine.token, ['SSE', 'FLOW', 'TASK']), timeout=30)
+    except Exception as error:
+        outcome['error'] = f'{type(error).__name__}: {error}'[:400]
+        return outcome
+    deadline = time.time() + settle
+    while time.time() < deadline:
+        try:
+            status = engine.status()
+            outcome['status'] = str(status.get('status') or '')[:400]
+            state = status.get('state')
+            outcome['state'] = int(getattr(state, 'value', state) or 0)
+            errors = status.get('errors') or []
+            if errors:
+                outcome['errors'] = [str(item)[:300] for item in errors][:3]
+            if 'logged in as' in outcome['status'] or outcome['state'] not in (None, 0, 1, 2, 3):
+                break
+        except Exception as error:
+            outcome['error'] = f'{type(error).__name__}: {error}'[:400]
+            break
+        time.sleep(1.5)
+    return outcome
+
+
+# -----------------------------------------------------------------------------
+# Observation helpers
+# -----------------------------------------------------------------------------
+
+
+def _tag(fid: str) -> str:
+    return f'[e2e {fid}]'
+
+
+def _has(tag: str) -> Callable[[discord.Message], bool]:
+    return lambda message: tag in message.content
+
+
+def _answer(driver, channel, posted, tag, timeout: float = 45):
+    return driver.wait_for_answer(channel, posted, timeout=timeout, match=_has(tag))
+
+
+def _quiet(driver, channel, posted, tag, settle: float = QUIET_SECONDS) -> List[discord.Message]:
+    """Wait ``settle`` seconds; return anything the bot posted carrying ``tag``."""
+    time.sleep(settle)
+    return [message for message in driver.answers_after(channel, posted) if tag in message.content]
+
+
+def _event(engine, event_type: str, correlation_id, timeout: float = 30) -> Optional[Dict[str, Any]]:
+    try:
+        return engine.wait_for_discord_event(event_type, correlation_id, timeout=timeout)
+    except AssertionError:
+        return None
+
+
+def _events(engine, event_type: str, correlation_id) -> List[Dict[str, Any]]:
+    return engine.discord_events(event_type, correlation_id)
+
+
+def _reason(engine, correlation_id, timeout: float = 30) -> str:
+    event = _event(engine, 'no_reply', correlation_id, timeout=timeout)
+    return str(event.get('reason')) if event else '<no no_reply event>'
+
+
+def _log_tail(since_bytes: int, pattern: str) -> List[str]:
+    """Lines matching ``pattern`` that the engine logged after ``since_bytes``."""
+    if not ENGINE_LOG or not os.path.exists(ENGINE_LOG):
+        return []
+    with open(ENGINE_LOG, encoding='utf-8', errors='replace') as handle:
+        handle.seek(since_bytes)
+        return [line.strip()[:240] for line in handle if re.search(pattern, line)]
+
+
+def _log_size() -> int:
+    return os.path.getsize(ENGINE_LOG) if ENGINE_LOG and os.path.exists(ENGINE_LOG) else 0
+
+
+def _media(tmpdir: str) -> Dict[str, str]:
+    """A tiny png, wav and mp4 plus two text-like files, all generated here."""
+    paths = {}
+    png = os.path.join(tmpdir, 'pixel.png')
+    with open(png, 'wb') as handle:
+        handle.write(
+            bytes.fromhex(
+                '89504e470d0a1a0a0000000d4948445200000001000000010806000000'
+                '1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082'
+            )
+        )
+    paths['png'] = png
+    wav = os.path.join(tmpdir, 'tone.wav')
+    with wave.open(wav, 'wb') as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b'\x00\x00' * 1600)
+    paths['wav'] = wav
+    mp4 = os.path.join(tmpdir, 'clip.mp4')
+    try:
+        subprocess.run(
+            ['ffmpeg', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=16x16:d=0.4']
+            + ['-pix_fmt', 'yuv420p', mp4],
+            check=True,
+            timeout=60,
+        )
+    except Exception:
+        with open(mp4, 'wb') as handle:
+            handle.write(b'\x00\x00\x00\x18ftypmp42' + b'\x00' * 64)
+    paths['mp4'] = mp4
+    notes = os.path.join(tmpdir, 'notes.md')
+    with open(notes, 'w', encoding='utf-8') as handle:
+        handle.write('# notes\nNOTES-BODY-MARKER: the pipeline must see this line.\n')
+    paths['md'] = notes
+    blob = os.path.join(tmpdir, 'data.bin')
+    with open(blob, 'wb') as handle:
+        handle.write(bytes(range(256)) * 4)
+    paths['bin'] = blob
+    return paths
+
+
+def _files(*paths: str) -> List[discord.File]:
+    return [discord.File(path) for path in paths]
+
+
+# -----------------------------------------------------------------------------
+# Fixtures
+# -----------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def fake_llm():
+    server = FakeLLM().start()
+    try:
+        yield server
+    finally:
+        server.close()
+        # The request log is the evidence for every fake-model case.
+        os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
+        with open(RESULTS_PATH.replace('.jsonl', '-fake-calls.json'), 'w', encoding='utf-8') as handle:
+            json.dump(server.calls, handle, indent=1, ensure_ascii=False)
+
+
+@pytest.fixture(scope='module')
+def tmp_media():
+    with tempfile.TemporaryDirectory(prefix='discord-e2e-') as tmpdir:
+        yield _media(tmpdir)
+
+
+@pytest.fixture(scope='module')
+def bot_id(engine_config) -> int:
+    return int(engine_config['botUserId'])
+
+
+# =============================================================================
+# Basics
+# =============================================================================
+
+
+def test_f01_reply_mode_channel(engine, engine_config, driver_bot):
+    tag = _tag('F01')
+    _start(engine, _echo(_params(engine_config, replyMode='channel')))
+    posted = driver_bot.post(f'{tag} channel mode question')
+    answer = _answer(driver_bot, driver_bot.channel, posted, tag)
+    outbound = _event(engine, 'outbound', posted.id)
+    ok = answer is not None and answer.reference is None and outbound and outbound['destination'] == 'channel'
+    _check(
+        'F01',
+        'replyMode',
+        'channel',
+        'plain channel message, no reply reference, outbound destination=channel',
+        ok,
+        f'answer={getattr(answer, "id", None)} reference={getattr(answer, "reference", None)} '
+        f'destination={outbound and outbound["destination"]}',
+        f'outbound messageIds={outbound and outbound["messageIds"]}',
+    )
+
+
+def test_f02_reply_mode_reply(engine, engine_config, driver_bot):
+    tag = _tag('F02')
+    _start(engine, _echo(_params(engine_config, replyMode='reply')))
+    posted = driver_bot.post(f'{tag} reply mode question')
+    answer = _answer(driver_bot, driver_bot.channel, posted, tag)
+    outbound = _event(engine, 'outbound', posted.id)
+    ref = answer.reference.message_id if answer is not None and answer.reference else None
+    pinged = bool(answer and answer.mentions)
+    ok = answer is not None and ref == posted.id and not pinged and outbound and outbound['destination'] == 'reply'
+    _check(
+        'F02',
+        'replyMode',
+        'reply',
+        'native reply to the question, author not pinged, destination=reply',
+        ok,
+        f'reference={ref} posted={posted.id} mentions={[m.id for m in (answer.mentions if answer else [])]}',
+        f'destination={outbound and outbound["destination"]}',
+    )
+
+
+def test_f03_reply_mode_thread_and_naming(engine, engine_config, driver_bot):
+    tag = _tag('F03')
+    # 'Q: ' + content cut at 25 lands on a space: the name must come back stripped.
+    _start(
+        engine,
+        _echo(_params(engine_config, replyMode='thread', threadName='Q: {content}', threadNameMaxLength=25)),
+    )
+    content = f'{tag} thread name test with words'
+    posted = driver_bot.post(content)
+    thread = driver_bot.wait_for_thread(posted, timeout=45)
+    answer = _answer(driver_bot, thread, posted, tag) if thread else None
+    outbound = _event(engine, 'outbound', posted.id)
+    expected_name = ('Q: ' + content)[:25].strip()
+    ok = (
+        thread is not None
+        and thread.name == expected_name
+        and len(thread.name) <= 25
+        and answer is not None
+        and outbound
+        and outbound['destination'] == 'thread'
+    )
+    _check(
+        'F03',
+        'replyMode / thread naming',
+        'thread mode, template "Q: {content}", max length 25 (cut on a space)',
+        f'thread {expected_name!r}, answer inside, destination=thread',
+        ok,
+        f'thread={getattr(thread, "name", None)!r} answer_in_thread={answer is not None} '
+        f'destination={outbound and outbound["destination"]}',
+        f'thread {getattr(thread, "id", None)}',
+    )
+
+
+def test_f04_thread_name_from_attachment(engine, engine_config, driver_bot, tmp_media):
+    tag = _tag('F04')
+    # The .md must be read as text, or an attachment-only message has no answer
+    # and the node never opens a thread.
+    _start(
+        engine,
+        _echo(_params(engine_config, replyMode='thread', threadName='{content}', textAttachmentExtensions=['.md'])),
+    )
+    posted = driver_bot.post(None, files=_files(tmp_media['md']))
+    thread = driver_bot.wait_for_thread(posted, timeout=45)
+    ok = thread is not None and thread.name == 'notes.md'
+    _check(
+        'F04',
+        'thread naming',
+        'attachment-only message (no text)',
+        'thread named after the first attachment (notes.md)',
+        ok,
+        f'thread={getattr(thread, "name", None)!r}',
+        f'posted {posted.id}',
+    )
+    del tag
+
+
+def test_f05_archive_minutes_valid_and_invalid(engine, engine_config, driver_bot):
+    tag = _tag('F05')
+    results = []
+    for minutes in (60, 61):
+        _start(engine, _echo(_params(engine_config, replyMode='thread', threadAutoArchiveMinutes=minutes)))
+        posted = driver_bot.post(f'{tag} archive {minutes}')
+        thread = driver_bot.wait_for_thread(posted, timeout=45)
+        answer = _answer(driver_bot, thread, posted, tag) if thread else None
+        results.append((minutes, getattr(thread, 'auto_archive_duration', None), answer is not None))
+    valid, invalid = results
+    ok = valid[1] == 60 and valid[2] and invalid[1] in (60, 1440, 4320, 10080) and invalid[2]
+    _check(
+        'F05',
+        'threadAutoArchiveMinutes',
+        '60 (valid) and 61 (invalid)',
+        '60 -> thread archives after 60; 61 -> channel default used, answer still posted',
+        ok,
+        f'60 -> duration {valid[1]}, answered {valid[2]}; 61 -> duration {invalid[1]}, answered {invalid[2]}',
+        'thread.auto_archive_duration read back by the driver',
+    )
+
+
+def test_f06_require_mention_global(engine, engine_config, driver_bot, bot_id):
+    tag = _tag('F06')
+    _start(engine, _echo(_params(engine_config, requireMention=True)))
+    plain = driver_bot.post(f'{tag} no mention')
+    quiet = _quiet(driver_bot, driver_bot.channel, plain, tag)
+    no_event = not _events(engine, 'message', plain.id)
+    mentioned = driver_bot.post(
+        f'<@{bot_id}> {tag} with mention', allowed_mentions=discord.AllowedMentions(users=[discord.Object(bot_id)])
+    )
+    answer = _answer(driver_bot, driver_bot.channel, mentioned, tag)
+    ok = not quiet and no_event and answer is not None
+    _check(
+        'F06',
+        'requireMention',
+        'global: without and with a bot mention',
+        'ignored (no event) without the mention; answered with it',
+        ok,
+        f'without: posts={len(quiet)} message_event={not no_event}; with: answered={answer is not None}',
+        f'questions {plain.id}, {mentioned.id}',
+    )
+
+
+def test_f07_require_mention_per_channel(engine, engine_config, driver_bot, bot_id):
+    tag = _tag('F07')
+    _start(
+        engine,
+        _echo(
+            _params(
+                engine_config,
+                requireMention=False,
+                requireMentionChannelIds=['${ROCKETRIDE_DISCORD_SUPPORT_CHANNEL_ID}'],
+                replyMode='thread',
+            )
+        ),
+    )
+    plain = driver_bot.post(f'{tag} no mention')
+    quiet = _quiet(driver_bot, driver_bot.channel, plain, tag)
+    mentioned = driver_bot.post(
+        f'<@{bot_id}> {tag} with mention', allowed_mentions=discord.AllowedMentions(users=[discord.Object(bot_id)])
+    )
+    thread = driver_bot.wait_for_thread(mentioned, timeout=45)
+    answer = _answer(driver_bot, thread, mentioned, tag) if thread else None
+    # A follow-up in the thread inherits the parent's rule.
+    follow = driver_bot.post(f'{tag} follow-up without mention', channel=thread) if thread else None
+    follow_quiet = _quiet(driver_bot, thread, follow, f'{tag} follow-up') if follow else ['no thread']
+    ok = not quiet and answer is not None and not follow_quiet
+    _check(
+        'F07',
+        'requireMentionChannelIds',
+        'support channel listed: plain, mentioned, thread follow-up without mention',
+        'plain ignored; mentioned answered; follow-up in its thread ignored (parent rule applies)',
+        ok,
+        f'plain posts={len(quiet)}; mentioned answered={answer is not None}; follow-up posts={len(follow_quiet)}',
+        f'thread {getattr(thread, "id", None)}',
+    )
+
+
+def test_f08_guild_and_channel_filters(engine, engine_config, driver_bot):
+    tag = _tag('F08')
+    other_guild = live_ids().get('guildId') or '900000000000000303'
+    rows = []
+    for label, overrides in (
+        ('other guild', {'guildIds': [other_guild]}),
+        ('other channel', {'channelIds': [FAKE_CHANNEL_ID]}),
+    ):
+        _start(engine, _echo(_params(engine_config, **overrides)))
+        posted = driver_bot.post(f'{tag} {label}')
+        quiet = _quiet(driver_bot, driver_bot.channel, posted, tag)
+        rows.append((label, len(quiet), bool(_events(engine, 'message', posted.id))))
+    ok = all(count == 0 and not event for _, count, event in rows)
+    _check(
+        'F08',
+        'guildIds / channelIds',
+        'support channel outside the guild allowlist; outside the channel allowlist',
+        'both ignored: no post, no message event',
+        ok,
+        '; '.join(f'{label}: posts={count} event={event}' for label, count, event in rows),
+        'allowlisted case is every other test',
+    )
+
+
+def test_f09_ignore_bots_and_allowed_bot_ids(engine, engine_config, driver_bot):
+    tag = _tag('F09')
+    rows = []
+    for label, overrides, expect_answer in (
+        ('ignoreBots on, driver not allowlisted', {'allowedBotIds': []}, False),
+        ('ignoreBots off', {'allowedBotIds': [], 'ignoreBots': False}, True),
+        ('ignoreBots on, driver allowlisted', {}, True),
+    ):
+        _start(engine, _echo(_params(engine_config, **overrides)))
+        posted = driver_bot.post(f'{tag} {label}')
+        if expect_answer:
+            got = _answer(driver_bot, driver_bot.channel, posted, tag) is not None
+        else:
+            got = bool(_quiet(driver_bot, driver_bot.channel, posted, tag))
+        rows.append((label, expect_answer, got))
+    ok = all(expect == got for _, expect, got in rows)
+    _check(
+        'F09',
+        'ignoreBots / allowedBotIds',
+        'driver bot not allowlisted; ignoreBots off; allowlisted',
+        'ignored; answered; answered',
+        ok,
+        '; '.join(f'{label}: answered={got}' for label, _, got in rows),
+        'driver is a bot account',
+    )
+
+
+def test_f10_typing_indicator(engine, engine_config, driver_bot, fake_llm, bot_id):
+    tag = _tag('F10')
+    rows = []
+    for show in (True, False):
+        _start(engine, _fake(_params(engine_config, showTyping=show), fake_llm))
+        since = time.time()
+        posted = driver_bot.post(f'{tag} typing={show} [fake:slow:6]')
+        answer = _answer(driver_bot, driver_bot.channel, posted, 'Fake answer after 6s', timeout=60)
+        typing = driver_bot.typing_by(bot_id, driver_bot.channel.id, since)
+        rows.append((show, len(typing), answer is not None))
+    ok = rows[0][1] >= 1 and rows[0][2] and rows[1][1] == 0 and rows[1][2]
+    _check(
+        'F10',
+        'showTyping',
+        'on and off around a 6 s pipeline',
+        'typing event(s) from the bot when on, none when off; answered both times',
+        ok,
+        '; '.join(f'showTyping={show}: typing events={count}, answered={ans}' for show, count, ans in rows),
+        'driver on_typing gateway events',
+    )
+
+
+def test_f11_send_responses_off(engine, engine_config, driver_bot):
+    tag = _tag('F11')
+    _start(engine, _echo(_params(engine_config, sendResponses=False)))
+    posted = driver_bot.post(f'{tag} listen only')
+    quiet = _quiet(driver_bot, driver_bot.channel, posted, tag)
+    outbound = _event(engine, 'outbound', posted.id)
+    message = _event(engine, 'message', posted.id, timeout=5)
+    ok = not quiet and message is not None and outbound and outbound['destination'] == 'suppressed'
+    _check(
+        'F11',
+        'sendResponses',
+        'off (listen only)',
+        'message ingested, nothing posted, outbound destination=suppressed with the answer text',
+        ok,
+        f'posts={len(quiet)} message_event={message is not None} destination={outbound and outbound["destination"]}',
+        f'outbound text={(outbound or {}).get("text", "")[:60]!r}',
+    )
+
+
+# =============================================================================
+# Answers
+# =============================================================================
+
+
+def _long_text(fid: str, lines: int) -> str:
+    return '\n'.join(f'{fid} line {index:04d} ' + 'x' * 12 for index in range(lines))
+
+
+def _chunks_in(thread, driver, posted) -> List[discord.Message]:
+    return [message for message in driver.answers_after(thread, posted, limit=50) if message.content.strip()]
+
+
+_LABEL = re.compile(r'\n*\*\(\d+/\d+\)\*$')
+
+
+def _reassemble(chunks: List[discord.Message], fid: str):
+    """Undo the chunker: drop labels and the synthetic fence close/reopen.
+
+    Returns the rebuilt text and how many chunk boundaries fell mid-line: the
+    last line before a synthetic closing fence is not one whole ``<fid> line``.
+    A boundary between lines consumes that newline (the fence pair stands in
+    for it), so the parts are joined with one.
+    """
+    whole = re.compile(rf'{re.escape(fid)} line \d{{4}} x{{12}}')
+    parts, midline = [], 0
+    for index, chunk in enumerate(chunks):
+        text = _LABEL.sub('', chunk.content).rstrip()
+        if index < len(chunks) - 1 and text.endswith('\n```'):
+            text = text[: -len('\n```')]
+            if not whole.fullmatch(text.rsplit('\n', 1)[-1]):
+                midline += 1
+        if index > 0 and text.startswith('```\n'):
+            text = text[len('```\n') :]
+        parts.append(text)
+    return '\n'.join(parts), midline
+
+
+def test_f12_long_answer_split(engine, engine_config, driver_bot, tmp_media):
+    rows = []
+    for fid, number in (('F12a', False), ('F12b', True)):
+        tag = _tag(fid)
+        _start(
+            engine,
+            _echo(
+                _params(
+                    engine_config,
+                    replyMode='thread',
+                    mergeAttachments=True,
+                    textAttachmentExtensions=['.txt'],
+                    textAttachmentMaxChars=20000,
+                    numberChunks=number,
+                )
+            ),
+        )
+        path = os.path.join(os.path.dirname(tmp_media['md']), f'{fid}.txt')
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write(_long_text(fid, 180))
+        posted = driver_bot.post(f'{tag} long answer', files=_files(path))
+        thread = driver_bot.wait_for_thread(posted, timeout=45)
+        time.sleep(12)
+        chunks = _chunks_in(thread, driver_bot, posted) if thread else []
+        joined, midline = _reassemble(chunks, fid)
+        lines_seen = [int(n) for n in re.findall(rf'{fid} line (\d{{4}}) x{{12}}', joined)]
+        labels = re.findall(r'\*\((\d+)/(\d+)\)\*', '\n'.join(chunk.content for chunk in chunks))
+        rows.append(
+            {
+                'fid': fid,
+                'number': number,
+                'chunks': len(chunks),
+                'max_len': max((len(c.content) for c in chunks), default=0),
+                'ordered': lines_seen == list(range(180)),
+                'labels': labels,
+                'midline': midline,
+            }
+        )
+    plain, numbered = rows
+    ok = (
+        plain['chunks'] >= 3
+        and plain['max_len'] <= 2000
+        and plain['ordered']
+        and plain['midline'] == 0
+        and numbered['midline'] == 0
+        and not plain['labels']
+        and numbered['chunks'] >= 3
+        and numbered['max_len'] <= 2000
+        and numbered['ordered']
+        and [int(i) for i, _ in numbered['labels']] == list(range(1, numbered['chunks'] + 1))
+    )
+    _check(
+        'F12',
+        'long answer split / numberChunks',
+        '~5.5k-char answer, numberChunks off then on',
+        'chunks <= 2000 chars, whole lines, in order; no labels when off; *(i/n)* labels 1..n when on',
+        ok,
+        f'off: {plain["chunks"]} chunks, max {plain["max_len"]}, ordered {plain["ordered"]}, labels {len(plain["labels"])}; '
+        f'on: {numbered["chunks"]} chunks, max {numbered["max_len"]}, ordered {numbered["ordered"]}, '
+        f'labels {["/".join(label) for label in numbered["labels"]]}',
+        f'reassembled from the thread; boundaries cut mid-line inside the code fence: '
+        f'off {plain["midline"]}, on {numbered["midline"]}; last chunk ends {(chunks[-1].content[-14:] if chunks else "")!r}',
+    )
+
+
+def test_f13_mentions_only_allowlisted_ping(engine, engine_config, driver_bot):
+    tag = _tag('F13')
+    driver_id = driver_bot.bot_id
+    team_role = engine_config['teamRoleId']
+    _start(
+        engine,
+        _echo(_params(engine_config, allowedMentionUserIds=[str(driver_id)], allowedMentionRoleIds=[FAKE_ROLE_ID])),
+    )
+    # The driver's own post pings nobody (mentions suppressed on send).
+    posted = driver_bot.post(f'{tag} @everyone <@&{team_role}> <@{driver_id}> please look')
+    answer = _answer(driver_bot, driver_bot.channel, posted, tag)
+    ok = (
+        answer is not None
+        and answer.mention_everyone is False
+        and [role.id for role in answer.role_mentions] == []
+        and [user.id for user in answer.mentions] == [driver_id]
+        and '@everyone' in answer.content
+    )
+    _check(
+        'F13',
+        'allowedMention*',
+        'answer containing @everyone, the team role and the driver user; only the driver allowlisted',
+        'only the allowlisted user is pinged; @everyone and the role stay inert text',
+        ok,
+        f'mention_everyone={getattr(answer, "mention_everyone", None)} '
+        f'role_mentions={[r.id for r in (answer.role_mentions if answer else [])]} '
+        f'user_mentions={"[driver]" if answer and [u.id for u in answer.mentions] == [driver_id] else [u.id for u in (answer.mentions if answer else [])]}',
+        'team role deliberately not allowlisted (it would ping real people)',
+    )
+
+
+# =============================================================================
+# Attachments
+# =============================================================================
+
+
+def _binary_lanes(engine, message_id) -> List[str]:
+    return [
+        str(event.get('mimeType')) for event in _events(engine, 'message', message_id) if event.get('lane') == 'binary'
+    ]
+
+
+def test_f15_media_routing(engine, engine_config, driver_bot, tmp_media):
+    tag = _tag('F15')
+    _start(engine, _echo(_params(engine_config, textAttachmentExtensions=['.md'])))
+    posted = driver_bot.post(
+        f'{tag} media routing',
+        files=_files(tmp_media['png'], tmp_media['wav'], tmp_media['mp4'], tmp_media['md']),
+    )
+    answer = _answer(driver_bot, driver_bot.channel, posted, tag)
+    time.sleep(6)
+    mimes = _binary_lanes(engine, posted.id)
+    texts = [event for event in _events(engine, 'message', posted.id) if event.get('lane') != 'binary']
+    framed = any('[attachment notes.md]' in str(event.get('text', '')) for event in texts)
+    ok = (
+        answer is not None
+        and any(m.startswith('image/') for m in mimes)
+        and any(m.startswith('audio/') for m in mimes)
+        and any(m.startswith('video/') for m in mimes)
+        and framed
+        and 'NOTES-BODY-MARKER' not in answer.content
+    )
+    _check(
+        'F15',
+        'attachments: image, audio, video, text',
+        'png + wav + mp4 + .md with text, mergeAttachments off',
+        'image/audio/video on their binary lanes; .md framed as text; reply is the text answer only',
+        ok,
+        f'binary lanes={mimes}; md framed={framed}; reply has file body={answer is not None and "NOTES-BODY-MARKER" in answer.content}',
+        f'{len(texts)} text object(s), {len(mimes)} binary object(s)',
+    )
+
+
+def test_f16_merge_attachments_on(engine, engine_config, driver_bot, tmp_media):
+    tag = _tag('F16')
+    _start(engine, _echo(_params(engine_config, textAttachmentExtensions=['.md'], mergeAttachments=True)))
+    posted = driver_bot.post(f'{tag} merged question', files=_files(tmp_media['md']))
+    answer = _answer(driver_bot, driver_bot.channel, posted, tag)
+    text_events = [e for e in _events(engine, 'message', posted.id) if e.get('lane') != 'binary']
+    ok = answer is not None and 'NOTES-BODY-MARKER' in answer.content and len(text_events) == 1
+    _check(
+        'F16',
+        'mergeAttachments',
+        'on: text + .md in one message',
+        'ONE text pass containing the question and the file; answer shows both',
+        ok,
+        f'answer has file body={answer is not None and "NOTES-BODY-MARKER" in answer.content}; text passes={len(text_events)}',
+        f'answer {getattr(answer, "id", None)}',
+    )
+
+
+def test_f17_text_extensions_off(engine, engine_config, driver_bot, tmp_media):
+    tag = _tag('F17')
+    _start(engine, _echo(_params(engine_config, textAttachmentExtensions=[], mergeAttachments=True)))
+    posted = driver_bot.post(f'{tag} md without extension list', files=_files(tmp_media['md']))
+    answer = _answer(driver_bot, driver_bot.channel, posted, tag)
+    time.sleep(4)
+    mimes = _binary_lanes(engine, posted.id)
+    ok = answer is not None and 'NOTES-BODY-MARKER' not in answer.content and len(mimes) == 1
+    _check(
+        'F17',
+        'textAttachmentExtensions',
+        'empty list (default): .md attachment',
+        '.md is NOT read as text; it travels as a binary object',
+        ok,
+        f'answer has file body={answer is not None and "NOTES-BODY-MARKER" in answer.content}; binary lanes={mimes}',
+        f'answer {getattr(answer, "id", None)}',
+    )
+
+
+def test_f18_oversized_and_unsupported(engine, engine_config, driver_bot, tmp_media):
+    tag = _tag('F18')
+    _start(engine, _echo(_params(engine_config, maxAttachmentBytes=600)))
+    posted = driver_bot.post(f'{tag} big and odd files', files=_files(tmp_media['bin'], tmp_media['png']))
+    answer = _answer(driver_bot, driver_bot.channel, posted, tag)
+    time.sleep(5)
+    events = _events(engine, 'message', posted.id)
+    mimes = _binary_lanes(engine, posted.id)
+    group = sorted({event['metadata'].get('groupSize') for event in events})
+    ok = answer is not None and mimes == ['image/png'] and group == [2]
+    _check(
+        'F18',
+        'maxAttachmentBytes',
+        '1 KB .bin over a 600-byte limit + a small png',
+        'oversized file skipped (never opened, not counted); png still routed; text answered',
+        ok,
+        f'binary lanes={mimes}; groupSize={group}; answered={answer is not None}',
+        f'{len(events)} message event(s)',
+    )
+    tag2 = _tag('F19')
+    _start(engine, _echo(_params(engine_config)))
+    posted2 = driver_bot.post(None, files=_files(tmp_media['bin']))
+    quiet = _quiet(driver_bot, driver_bot.channel, posted2, '', settle=12)
+    mimes2 = _binary_lanes(engine, posted2.id)
+    reason = _reason(engine, posted2.id, timeout=10)
+    ok2 = not quiet and mimes2 == ['application/octet-stream'] and reason == 'no_answer'
+    _check(
+        'F19',
+        'unsupported attachment type',
+        '.bin only (application/octet-stream)',
+        'routed to the tag stream, no crash, nothing posted, no_reply reason no_answer',
+        ok2,
+        f'binary lanes={mimes2}; posts={len(quiet)}; no_reply={reason}',
+        f'{tag2} attachment-only message {posted2.id}',
+    )
+
+
+# =============================================================================
+# Message filtering
+# =============================================================================
+
+
+def test_f27_system_and_empty_messages(engine, engine_config, driver_bot):
+    tag = _tag('F27')
+    _start(engine, _echo(_params(engine_config)))
+    since = time.time()
+    thread = driver_bot.open_thread(f'{tag} bare thread', minutes=60)
+    embed_only = driver_bot.post(None, embed=discord.Embed(title=f'{tag} embed only', description='no text'))
+    time.sleep(QUIET_SECONDS)
+    message_events = [
+        e
+        for e in engine.discord_events('message')
+        if (e.get('metadata') or {}).get('authorId') == str(driver_bot.bot_id)
+    ]
+    late = [e for e in message_events if str((e.get('metadata') or {}).get('messageId')) == str(embed_only.id)]
+    posts = [m for m in driver_bot.answers_after(driver_bot.channel, embed_only) if tag in m.content]
+    ok = not late and not posts and time.time() - since >= QUIET_SECONDS
+    _check(
+        'F27',
+        'system / empty messages',
+        '"started a thread" system notice and an embed-only message (no text, no file)',
+        'both ignored: no message event, nothing posted',
+        ok,
+        f'embed-only message events={len(late)}; posts={len(posts)}; driver message events in window={len(message_events)}',
+        f'driver thread {thread.id}',
+    )
+
+
+# =============================================================================
+# Startup and config
+# =============================================================================
+
+
+def test_f36_member_metadata_without_intent(engine, engine_config):
+    outcome = _start_raw(engine, _echo(_params(engine_config, includeMemberMetadata=True)), settle=30)
+    text = ' '.join(str(v) for v in outcome.values())
+    logged_in = 'logged in as' in outcome.get('status', '')
+    clear = 'enable the Server Members Intent' in text
+    ok = logged_in or clear
+    _check(
+        'F36',
+        'includeMemberMetadata',
+        'on, on a bot whose Server Members intent may be off',
+        'either runs with member metadata, or fails fast leading with the Server Members intent',
+        ok,
+        f'logged in={logged_in}; names Server Members={clear}; state={outcome.get("state")}',
+        f'status={outcome.get("status")[:160]!r} errors={outcome.get("errors")}',
+    )
+    engine.terminate()
+
+
+def test_f37_numbers_and_lists_as_text(engine, engine_config, driver_bot):
+    tag = _tag('F37')
+    _start(
+        engine,
+        _echo(
+            _params(
+                engine_config,
+                replyMode='thread',
+                threadName='{content}',
+                threadNameMaxLength='20',
+                threadAutoArchiveMinutes='60',
+                allowedBotIds=str(engine_config['driverBotId']),
+                channelIds='["${ROCKETRIDE_DISCORD_SUPPORT_CHANNEL_ID}"]',
+            )
+        ),
+    )
+    posted = driver_bot.post(f'{tag} numbers as text')
+    thread = driver_bot.wait_for_thread(posted, timeout=45)
+    answer = _answer(driver_bot, thread, posted, tag) if thread else None
+    ok = thread is not None and len(thread.name) <= 20 and thread.auto_archive_duration == 60 and answer is not None
+    _check(
+        'F37',
+        'config coercion',
+        'numbers as strings, a bare-string id, a JSON-text channel list',
+        'all honoured: name <= 20, archive 60, driver allowed, channel matched',
+        ok,
+        f'thread={getattr(thread, "name", None)!r} archive={getattr(thread, "auto_archive_duration", None)} answered={answer is not None}',
+        f'thread {getattr(thread, "id", None)}',
+    )
+
+
+def _status_warnings(engine, needle: str) -> List[str]:
+    return [str(item)[-200:] for item in (engine.status().get('warnings') or []) if needle in str(item)]
+
+
+def test_f38_bad_json_list(engine, engine_config, driver_bot):
+    tag = _tag('F38')
+    _start(engine, _echo(_params(engine_config, allowedBotIds=f'["{engine_config["driverBotId"]}"')))
+    posted = driver_bot.post(f'{tag} bad json allowlist')
+    quiet = _quiet(driver_bot, driver_bot.channel, posted, tag)
+    warned = _status_warnings(engine, 'allowedBotIds')
+    running = engine.state() == TASK_STATE_RUNNING
+    _check(
+        'F38',
+        'config coercion',
+        'allowedBotIds given as broken JSON text',
+        'no crash; the driver is not allowed; the task warnings name the setting',
+        running and not quiet and any('not valid JSON' in item for item in warned),
+        f'running={running}; answered={bool(quiet)}; warnings naming allowedBotIds={len(warned)}',
+        f'task warning: {warned[:1]}',
+    )
+
+
+def test_f38b_bad_json_channel_list(engine, engine_config):
+    outcome = _start_raw(
+        engine, _echo(_params(engine_config, channelIds='["${ROCKETRIDE_DISCORD_SUPPORT_CHANNEL_ID}"'))
+    )
+    text = ' '.join(str(value) for value in outcome.values())
+    logged_in = 'logged in as' in outcome.get('status', '')
+    _check(
+        'F38b',
+        'config coercion',
+        'channelIds given as broken JSON text',
+        'the start fails with a message naming channelIds (a bot that answers nothing is not left running)',
+        not logged_in and 'channelIds is not valid JSON' in text,
+        f'logged in={logged_in}; state={outcome.get("state")}',
+        f'task error={str((outcome.get("errors") or [""])[0])[-150:]!r}',
+    )
+    engine.terminate()
+
+
+def test_f39_token_missing_and_invalid(engine, engine_config):
+    rows = []
+    for label, token in (
+        ('missing variable', '${ROCKETRIDE_DISCORD_E2E_NO_SUCH_TOKEN}'),
+        ('invalid token', 'not-a-real-discord-token'),
+    ):
+        outcome = _start_raw(engine, _echo(_params(engine_config, botToken=token)), settle=25)
+        rows.append((label, outcome))
+        engine.terminate()
+    alive = engine_reachable(engine_config['engineUri'])
+    texts = [' '.join(str(v) for v in outcome.values()) for _, outcome in rows]
+    clear = [
+        'ROCKETRIDE_DISCORD_E2E_NO_SUCH_TOKEN is not set' in texts[0],
+        'login failed (invalid token)' in texts[1],
+    ]
+    no_login = ['logged in as' not in text for text in texts]
+    ok = all(clear) and all(no_login) and alive is not False
+    _check(
+        'F39',
+        'botToken',
+        'missing variable; invalid token',
+        'missing: fails naming the unset variable; invalid: "login failed (invalid token)"; engine keeps serving',
+        ok,
+        '; '.join(
+            f'{label}: state={o.get("state")} status={o.get("status", "")[:40]!r} '
+            f'task error={str((o.get("errors") or [""])[0])[-160:]!r}'
+            for label, o in rows
+        ),
+        f'engine reachable afterwards={alive is not False}',
+    )
+
+
+# =============================================================================
+# Failures
+# =============================================================================
+
+
+def test_f41_pipeline_slow_beyond_a_minute(engine, engine_config, driver_bot, fake_llm):
+    tag = _tag('F41')
+    _start(engine, _fake(_params(engine_config), fake_llm))
+    slow = driver_bot.post(f'{tag} very slow [fake:hang:90]')
+    started = time.time()
+    other = driver_bot.post(f'{tag} meanwhile a quick one')
+    other_answer = _answer(driver_bot, driver_bot.channel, other, 'meanwhile a quick one', timeout=40)
+    other_latency = time.time() - started
+    slow_answer = _answer(driver_bot, driver_bot.channel, slow, 'Fake answer after 90s', timeout=150)
+    slow_latency = time.time() - started
+    reason = _reason(engine, slow.id, timeout=2)
+    _record(
+        'F41',
+        'pipeline times out',
+        'model takes 90 s; a second question meanwhile',
+        'no node-side timeout exists: the slow answer arrives late; the other question is not blocked',
+        f'quick answered in {other_latency:.0f}s ({other_answer is not None}); slow answered={slow_answer is not None} '
+        f'after {slow_latency:.0f}s; no_reply={reason}',
+        other_answer is not None and slow_answer is not None,
+        'the node has no pipeline timeout setting; the model client timed out or not as shown',
+    )
+    assert other_answer is not None, 'a slow pipeline blocked other questions'
+
+
+def test_f42_thread_creation_refused(engine, engine_config, driver_bot, fake_llm):
+    tag = _tag('F42')
+    _start(engine, _fake(_params(engine_config, replyMode='thread'), fake_llm))
+    posted = driver_bot.post(f'{tag} thread already taken [fake:slow:5]')
+    # Take the message's one thread before the node can: its create_thread then fails.
+    taken = driver_bot.open_thread(f'{tag} driver thread', message=posted)
+    answer = _answer(driver_bot, driver_bot.channel, posted, 'Fake answer after 5s', timeout=45)
+    outbound = _event(engine, 'outbound', posted.id) or {}
+    in_driver_thread = [m for m in driver_bot.answers_after(taken, posted) if 'Fake answer' in m.content]
+    ok = answer is not None and outbound.get('destination') == 'reply' and not in_driver_thread
+    _check(
+        'F42',
+        'thread creation refused',
+        'the question already has a thread (created by the driver first)',
+        'create_thread fails; the answer is posted as a reply in the channel (destination=reply)',
+        ok,
+        f'answered in channel={answer is not None}; destination={outbound.get("destination")}; posts in the taken thread={len(in_driver_thread)}',
+        "the refusal is produced by taking the question's one thread before the node can",
+    )
+
+
+def test_f43_reply_fails_to_post(engine, engine_config, driver_bot, fake_llm):
+    tag = _tag('F43')
+    _start(engine, _fake(_params(engine_config, replyMode='reply'), fake_llm))
+    posted = driver_bot.post(f'{tag} delete me before the answer [fake:slow:6]')
+    time.sleep(2)
+    driver_bot.delete(posted)
+    time.sleep(15)
+    reason = _reason(engine, posted.id, timeout=20)
+    posts = [m for m in driver_bot.answers_after(driver_bot.channel, posted) if 'Fake answer after 6s' in m.content]
+    ok = reason == 'send_failed' and not posts
+    _check(
+        'F43',
+        'send failure',
+        'question deleted while the pipeline runs (reply target gone)',
+        'nothing posted; no_reply reason send_failed',
+        ok,
+        f'no_reply={reason}; posts={len(posts)}',
+        f'question {posted.id} (deleted)',
+    )
+
+
+def test_f44_discord_rate_limit(engine, engine_config, driver_bot, tmp_media):
+    tag = _tag('F44')
+    _start(
+        engine,
+        _echo(
+            _params(
+                engine_config,
+                replyMode='thread',
+                mergeAttachments=True,
+                textAttachmentExtensions=['.txt'],
+                textAttachmentMaxChars=40000,
+            )
+        ),
+    )
+    path = os.path.join(os.path.dirname(tmp_media['md']), 'F44.txt')
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write(_long_text('F44', 760))
+    mark = _log_size()
+    posted = driver_bot.post(f'{tag} rate limit', files=_files(path))
+    thread = driver_bot.wait_for_thread(posted, timeout=45)
+    time.sleep(40)
+    chunks = _chunks_in(thread, driver_bot, posted) if thread else []
+    joined, midline = _reassemble(chunks, 'F44')
+    lines_seen = [int(n) for n in re.findall(r'F44 line (\d{4}) x{12}', joined)]
+    stamps = [chunk.created_at.timestamp() for chunk in chunks]
+    gaps = [round(b - a, 2) for a, b in zip(stamps, stamps[1:])]
+    limited = _log_tail(mark, r'rate limit')
+    # Discord allows 5 messages per 5 s per channel: a burst of 10+ must stall
+    # once, and every chunk must still arrive, in order.
+    ok = len(chunks) >= 10 and lines_seen == list(range(760)) and max(gaps, default=0) >= 2.0 and midline == 0
+    _check(
+        'F44',
+        'Discord rate limit',
+        f'~{len(_long_text("F44", 760)) // 1000}k-char answer posted as many chunks in a burst',
+        'every chunk lands, whole lines, in order, nothing dropped; discord.py waits out the 429s',
+        ok,
+        f'chunks={len(chunks)}; all lines in order={lines_seen == list(range(760))}; largest gap={max(gaps, default=0)}s; '
+        f'span={round(stamps[-1] - stamps[0], 1) if stamps else 0}s',
+        f'gaps between chunks={gaps}; mid-line cuts={midline}; log lines mentioning rate limit={len(limited)}',
+    )
