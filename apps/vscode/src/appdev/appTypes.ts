@@ -31,6 +31,7 @@ import { spawn } from 'child_process';
 import * as vscode from 'vscode';
 import { getLogger } from '../shared/util/output';
 import { ConnectionManager } from '../connection/connection';
+import { MISSING_PNPM_MESSAGE, isPnpmMissingError, promptMissingPnpm } from './pnpm';
 
 /**
  * Result of a shell vendor pass — success carries the artifact path,
@@ -503,7 +504,14 @@ function runRootInstall(workspaceRoot: string): Promise<void> {
 			}
 			finish(new Error('pnpm install timed out after 10 minutes'));
 		}, 10 * 60 * 1000);
-		proc.on('error', (err) => finish(err));
+		proc.on('error', (err) => {
+			if (isPnpmMissingError(err)) {
+				void promptMissingPnpm();
+				finish(new Error(MISSING_PNPM_MESSAGE));
+			} else {
+				finish(err);
+			}
+		});
 		proc.on('close', (code) => {
 			if (code === 0) finish();
 			else finish(new Error(`pnpm install failed: ${extractInstallCause(output, code)}`));
