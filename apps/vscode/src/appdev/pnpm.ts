@@ -25,9 +25,9 @@
  * App Builder pnpm presence checks and user interaction.
  */
 import * as vscode from 'vscode';
-import { MISSING_PNPM_MESSAGE, isPnpmMissingError, checkPnpmInstalled } from '../shared/util/pnpm';
+import { MISSING_PNPM_MESSAGE, isPnpmMissingError, checkPnpmInstalled, isWindowsMissingPnpmShellExit } from '../shared/util/pnpm';
 
-export { MISSING_PNPM_MESSAGE, isPnpmMissingError, checkPnpmInstalled };
+export { MISSING_PNPM_MESSAGE, isPnpmMissingError, checkPnpmInstalled, isWindowsMissingPnpmShellExit };
 
 let lastPromptTime = 0;
 const PROMPT_DEBOUNCE_MS = 5000;

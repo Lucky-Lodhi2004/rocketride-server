@@ -23,7 +23,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isPnpmMissingError, checkPnpmInstalled } from '../shared/util/pnpm';
+import { isPnpmMissingError, checkPnpmInstalled, isWindowsMissingPnpmShellExit } from '../shared/util/pnpm';
 
 test('isPnpmMissingError identifies code ENOENT', () => {
 	const err = new Error('spawn ENOENT');
@@ -34,6 +34,12 @@ test('isPnpmMissingError identifies code ENOENT', () => {
 test('isPnpmMissingError identifies ENOENT in message', () => {
 	const err = new Error('spawn pnpm ENOENT');
 	assert.equal(isPnpmMissingError(err), true);
+});
+
+test('isPnpmMissingError does not identify ENOENT in message if code is present', () => {
+	const err = new Error('spawn pnpm ENOENT');
+	(err as NodeJS.ErrnoException).code = 'EPERM';
+	assert.equal(isPnpmMissingError(err), false);
 });
 
 test('isPnpmMissingError returns false for other errors or falsy values', () => {
@@ -59,4 +65,19 @@ test('checkPnpmInstalled resolves false when exec fails', async () => {
 	}) as any;
 	const installed = await checkPnpmInstalled(mockExec);
 	assert.equal(installed, false);
+});
+
+test('isWindowsMissingPnpmShellExit identifies missing pnpm on win32', () => {
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+	Object.defineProperty(process, 'platform', { value: 'win32' });
+	
+	try {
+		assert.equal(isWindowsMissingPnpmShellExit(1, "'pnpm' is not recognized as an internal or external command"), true);
+		assert.equal(isWindowsMissingPnpmShellExit(0, "'pnpm' is not recognized as an internal or external command"), false);
+		assert.equal(isWindowsMissingPnpmShellExit(1, "some other error"), false);
+	} finally {
+		if (originalPlatform) {
+			Object.defineProperty(process, 'platform', originalPlatform);
+		}
+	}
 });

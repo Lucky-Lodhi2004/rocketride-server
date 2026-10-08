@@ -38,9 +38,21 @@ export const MISSING_PNPM_MESSAGE =
 export function isPnpmMissingError(err: unknown): boolean {
 	if (!err) return false;
 	const e = err as NodeJS.ErrnoException;
-	if (e.code === 'ENOENT') return true;
+	if (e.code !== undefined) {
+		return e.code === 'ENOENT';
+	}
 	if (typeof e.message === 'string' && e.message.includes('ENOENT')) return true;
 	return false;
+}
+
+/**
+ * Tests whether a Windows shell exit indicates that pnpm is missing.
+ *
+ * @param code - Process exit code.
+ * @param output - Process stdout/stderr output.
+ */
+export function isWindowsMissingPnpmShellExit(code: number | null, output: string): boolean {
+	return process.platform === 'win32' && code !== 0 && code !== null && output.includes('\'pnpm\' is not recognized');
 }
 
 /**
