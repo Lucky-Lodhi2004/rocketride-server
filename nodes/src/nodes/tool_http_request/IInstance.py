@@ -93,42 +93,39 @@ def _take_exact_host(source, position):
     return ''.join(literal), position
 
 
-def _take_exact_host_or_group(source, position, actual_host):
+def _take_exact_host_or_group(source, position):
     """Parse a single exact host or an alternation group of exact hosts.
 
-    Returns (matched_flag, next_position) or None if syntax is invalid.
+    Returns a tuple of (host_list, end_position), or None if the syntax is invalid.
     """
     if source.startswith('(', position):
         is_non_capturing = source.startswith('(?:', position)
         branch_pos = position + (3 if is_non_capturing else 1)
-        matched = False
+        hosts = []
 
         while True:
             host_result = _take_exact_host(source, branch_pos)
             if host_result is None:
                 return None
             branch_host, next_pos = host_result
-            if branch_host.lower() == actual_host.lower():
-                matched = True
+            hosts.append(branch_host)
 
             branch_pos = next_pos
             if branch_pos < len(source) and source[branch_pos] == '|':
                 branch_pos += 1
                 continue
-            elif branch_pos < len(source) and source[branch_pos] == ')':
+            if branch_pos < len(source) and source[branch_pos] == ')':
                 branch_pos += 1
                 break
-            else:
-                return None
-
-        return matched, branch_pos
-    else:
-        host_result = _take_exact_host(source, position)
-        if host_result is None:
             return None
-        source_host, next_pos = host_result
-        return source_host.lower() == actual_host.lower(), next_pos
 
+        return hosts, branch_pos
+
+    host_result = _take_exact_host(source, position)
+    if host_result is None:
+        return None
+    source_host, next_pos = host_result
+    return [source_host], next_pos
 
 
 def _take_positive_numeric_quantifier(source, position):
@@ -334,12 +331,12 @@ def _recognizes_authority_policy(pattern, canonical_url):
         if authority_length < minimum or maximum is not None and authority_length > maximum:
             return False
     else:
-        actual_host = f'[{parsed.hostname}]' if parsed.netloc.startswith('[') else parsed.hostname
-        host_group_result = _take_exact_host_or_group(source, position, actual_host)
+        host_group_result = _take_exact_host_or_group(source, position)
         if host_group_result is None:
             return False
-        host_matched, position = host_group_result
-        if not host_matched:
+        source_hosts, position = host_group_result
+        actual_host = f'[{parsed.hostname}]' if parsed.netloc.startswith('[') else parsed.hostname
+        if not any(h.lower() == actual_host.lower() for h in source_hosts):
             return False
         port_result = _take_port_policy(source, position)
         if port_result is None:
